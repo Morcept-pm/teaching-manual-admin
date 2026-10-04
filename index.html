@@ -98,6 +98,20 @@
   .upload-row input[type=file] { font-size: 12px; }
   .hint { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
 
+  /* Rich text editor (解決方式) */
+  .rte-wrap { border: 1.5px solid var(--border); border-radius: var(--radius-sm); }
+  .rte-wrap:focus-within { border-color: var(--yellow); box-shadow: 0 0 0 3px rgba(248,203,42,.15); }
+  .rte-toolbar { display: flex; align-items: center; gap: 4px; padding: 5px 6px; background: #FAFAF7; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .rte-toolbar button { border: 1px solid transparent; background: none; border-radius: 4px; width: 26px; height: 26px; cursor: pointer; font-size: 13px; color: var(--text-secondary); }
+  .rte-toolbar button:hover { background: var(--yellow-light); border-color: var(--border); }
+  .rte-toolbar .rte-color { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--border); cursor: pointer; padding: 0; }
+  .rte-toolbar .rte-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+  .rte-editor { min-height: 110px; max-height: 340px; overflow-y: auto; padding: 8px 10px; font-size: 13px; font-family: inherit; color: var(--text-primary); line-height: 1.6; }
+  .rte-editor:focus { outline: none; }
+  .rte-editor p { margin: 0 0 8px; }
+  .rte-editor p:last-child { margin-bottom: 0; }
+  .rte-editor:empty:before { content: attr(data-placeholder); color: var(--text-muted); }
+
   .hidden { display: none !important; }
 </style>
 </head>
@@ -201,6 +215,26 @@ function doLogin() {
 }
 function doLogout() { auth.signOut(); }
 
+// ── 使用行為記錄（給 AI 工具中心儀表板讀取，見 firestore.rules 的 tool_events）──
+function getSessionId() {
+  let sid = sessionStorage.getItem('tm_admin_session_id');
+  if (!sid) {
+    sid = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+    sessionStorage.setItem('tm_admin_session_id', sid);
+  }
+  return sid;
+}
+function logToolEvent(type, target) {
+  db.collection('tool_events').add({
+    source: 'admin-site',
+    type: type,
+    target: String(target).slice(0, 280),
+    session_id: getSessionId(),
+    user: auth.currentUser ? auth.currentUser.email : null,
+    timestamp: firebase.firestore.FieldValue.serverTimestamp()
+  }).catch(err => console.error('logToolEvent failed', err));
+}
+
 // ── Load data ──
 async function loadAll() {
   const [guidesSnap, articlesSnap, metaSnap] = await Promise.all([
@@ -301,8 +335,8 @@ function openGuide(docId) {
       </div>
 
       <div class="card-block">
-        <h3>提醒 / 小提醒（可用 &lt;strong&gt; 加粗）</h3>
-        <div class="field"><textarea id="f-tip" rows="2">${escHtml(g.tip||'')}</textarea></div>
+        <h3>提醒 / 小提醒</h3>
+        <div class="field">${richEditorHtml('f-tip', g.tip||'', '輸入提醒內容，可分段落、加粗或標色')}</div>
       </div>
 
       <div class="card-block">
@@ -352,6 +386,7 @@ async function saveGuide() {
     const steps = collectDynRows('stepsRows');
     const innerQAs = collectInnerQaRows();
     const related = collectRelatedRows();
+    const tip = sanitizeAnswerHtml(document.getElementById('f-tip').innerHTML.trim());
 
     const payload = {
       id: currentId,
@@ -361,12 +396,13 @@ async function saveGuide() {
       subtitle: document.getElementById('f-subtitle').value.trim(),
       image: imageUrl,
       caption: document.getElementById('f-caption').value.trim(),
-      steps, tip: document.getElementById('f-tip').value.trim(),
+      steps, tip,
       innerQAs, related
     };
     await db.collection('guides').doc(currentId).set(payload);
     Object.assign(g, payload);
     pendingImageFile = null;
+    logToolEvent('edit_guide', currentId + ':' + payload.title);
     showStatus('已儲存，公開手冊網頁稍後會自動更新', true);
   } catch (err) {
     console.error(err);
@@ -414,7 +450,11 @@ function renderArticleForm(a, isNew) {
           <datalist id="catOptions">${existingCats.map(c => `<option value="${escAttr(c)}">`).join('')}</datalist>
         </div>
         <div class="field"><label>問題</label><input id="f-q" value="${escAttr(a.q)}"></div>
-        <div class="field"><label>解決方式</label><textarea id="f-a" rows="4">${escHtml(a.a)}</textarea></div>
+        <div class="field">
+          <label>解決方式</label>
+          ${richEditorHtml('f-a', a.a, '輸入解決方式，Enter 換段落，可加粗或標色')}
+          <div class="hint">按 Enter 換新段落；選取文字後可加粗或標色</div>
+        </div>
         <div class="field">
           <label>適用方案</label>
           <div class="plans-row">${plansChecks}</div>
@@ -432,11 +472,13 @@ async function saveArticle(isNew) {
   try {
     const cat = document.getElementById('f-cat').value.trim();
     const q = document.getElementById('f-q').value.trim();
-    const ans = document.getElementById('f-a').value.trim();
+    const ansEl = document.getElementById('f-a');
+    const ans = sanitizeAnswerHtml(ansEl.innerHTML.trim());
+    const ansPlain = ansEl.textContent.trim();
     const plans = [...document.querySelectorAll('.plan-chk:checked')].map(el => el.value);
     const kw = document.getElementById('f-kw').value.split('\n').map(s => s.trim()).filter(Boolean);
 
-    if (!cat || !q || !ans) { showStatus('分類、問題、解決方式為必填', false); return; }
+    if (!cat || !q || !ansPlain) { showStatus('分類、問題、解決方式為必填', false); return; }
 
     let id, docId;
     if (isNew) {
@@ -459,6 +501,7 @@ async function saveArticle(isNew) {
       Object.assign(ARTICLES.find(x => x._docId === docId), payload);
     }
     renderSidebar();
+    logToolEvent('edit_article', docId + ':' + q);
     showStatus('已儲存，公開手冊網頁稍後會自動更新', true);
   } catch (err) {
     console.error(err);
@@ -469,12 +512,14 @@ async function saveArticle(isNew) {
 async function deleteArticle() {
   if (!confirm('確定要刪除這則常見問題嗎？此動作無法復原。')) return;
   try {
+    const deletedId = currentId;
     await db.collection('articles').doc(currentId).delete();
     ARTICLES = ARTICLES.filter(x => x._docId !== currentId);
     currentType = null; currentId = null;
     document.getElementById('editPanel').innerHTML = '';
     document.getElementById('emptyPanel').classList.remove('hidden');
     renderSidebar();
+    logToolEvent('delete_article', deletedId);
   } catch (err) {
     alert('刪除失敗：' + err.message);
   }
@@ -494,10 +539,13 @@ function collectDynRows(containerId) {
   return [...document.querySelectorAll(`#${containerId} .dyn-row input`)].map(i => i.value.trim()).filter(Boolean);
 }
 
+let iqaSeq = 0;
 function innerQaRowHtml(q, a) {
+  const editorId = 'iq-a-' + (++iqaSeq);
   return `<div class="inner-qa-row">
     <div class="dyn-row"><input placeholder="問題" value="${escAttr(q)}" class="iq-q"></div>
-    <div class="dyn-row"><textarea rows="2" placeholder="回答" class="iq-a">${escHtml(a)}</textarea>
+    <div class="dyn-row">
+      <div style="flex:1;">${richEditorHtml(editorId, a, '輸入回答，可分段落、加粗或標色', 'iq-a')}</div>
       <button class="rm-btn" onclick="this.closest('.inner-qa-row').remove()">×</button>
     </div>
   </div>`;
@@ -506,10 +554,14 @@ function addInnerQaRow() {
   document.getElementById('innerQaRows').insertAdjacentHTML('beforeend', innerQaRowHtml('', ''));
 }
 function collectInnerQaRows() {
-  return [...document.querySelectorAll('#innerQaRows .inner-qa-row')].map(row => ({
-    q: row.querySelector('.iq-q').value.trim(),
-    a: row.querySelector('.iq-a').value.trim()
-  })).filter(x => x.q && x.a);
+  return [...document.querySelectorAll('#innerQaRows .inner-qa-row')].map(row => {
+    const aEl = row.querySelector('.iq-a');
+    return {
+      q: row.querySelector('.iq-q').value.trim(),
+      a: sanitizeAnswerHtml(aEl.innerHTML.trim()),
+      _aPlain: aEl.textContent.trim()
+    };
+  }).filter(x => x.q && x._aPlain).map(({ q, a }) => ({ q, a }));
 }
 
 function relatedRowHtml(r) {
@@ -542,6 +594,167 @@ function collectRelatedRows() {
 // ══════════════ Utils ══════════════
 function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+// ── Rich text editor（解決方式／提醒／延伸問題回答共用）──
+function richEditorHtml(id, raw, placeholder, extraClass) {
+  return `<div class="rte-wrap">
+    <div class="rte-toolbar" onmousedown="event.preventDefault()">
+      <button type="button" title="粗體" onclick="rteExec('${id}','bold')"><b>B</b></button>
+      <span class="rte-sep"></span>
+      <button type="button" class="rte-color" style="background:#151C31" title="深藍（預設）" onclick="rteColor('${id}','#151C31')"></button>
+      <button type="button" class="rte-color" style="background:#DC2626" title="紅色" onclick="rteColor('${id}','#DC2626')"></button>
+      <button type="button" class="rte-color" style="background:#2563EB" title="藍色" onclick="rteColor('${id}','#2563EB')"></button>
+      <button type="button" class="rte-color" style="background:#16A34A" title="綠色" onclick="rteColor('${id}','#16A34A')"></button>
+      <button type="button" class="rte-color" style="background:#E6B800" title="黃色" onclick="rteColor('${id}','#E6B800')"></button>
+      <span class="rte-sep"></span>
+      <button type="button" title="清除格式" onclick="rteExec('${id}','removeFormat')">✕</button>
+    </div>
+    <div id="${id}" class="rte-editor ${extraClass||''}" contenteditable="true" onfocus="document.execCommand('defaultParagraphSeparator', false, 'p')" data-placeholder="${escAttr(placeholder||'')}">${answerToEditorHtml(raw)}</div>
+  </div>`;
+}
+function rteExec(id, cmd) {
+  document.getElementById(id).focus();
+  // styleWithCSS 是整份文件共用的開關，rteColor() 開過之後若不關掉，
+  // 這裡的 bold 會變成 style="font-weight:..."，被 sanitizeAnswerHtml 的顏色白名單濾掉而消失。
+  document.execCommand('styleWithCSS', false, false);
+  document.execCommand(cmd, false, null);
+}
+function rteColor(id, color) {
+  document.getElementById(id).focus();
+  document.execCommand('styleWithCSS', false, true);
+  document.execCommand('foreColor', false, color);
+}
+// 舊資料是純文字（\n 分行），還沒被存成 HTML 前，載入編輯器時先轉成段落，
+// 這樣舊的常見問題一打開就能直接用新編輯器繼續編輯。
+function answerToEditorHtml(raw) {
+  const s = String(raw || '');
+  if (/<[a-z][\s\S]*>/i.test(s)) return s;
+  return s.split(/\n{2,}/).map(p => `<p>${escHtml(p).replace(/\n/g,'<br>')}</p>`).join('');
+}
+// 存檔前清掉 contenteditable 可能夾帶的雜訊標籤／屬性，只留段落、粗體、顏色。
+const RTE_ALLOWED_TAGS = { P:1, BR:1, STRONG:1, B:1, EM:1, I:1, U:1, SPAN:1, DIV:1 };
+const RTE_STRIP_ENTIRELY_TAGS = { SCRIPT:1, STYLE:1, IFRAME:1, OBJECT:1, EMBED:1, LINK:1, META:1 };
+function sanitizeAnswerHtml(html) {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  (function clean(node) {
+    [...node.childNodes].forEach(child => {
+      if (child.nodeType === 1) {
+        if (RTE_STRIP_ENTIRELY_TAGS[child.tagName]) {
+          node.removeChild(child);
+          return;
+        }
+        if (!RTE_ALLOWED_TAGS[child.tagName]) {
+          while (child.firstChild) node.insertBefore(child.firstChild, child);
+          node.removeChild(child);
+          return;
+        }
+        [...child.attributes].forEach(attr => {
+          if (attr.name === 'style') {
+            const color = child.style.color;
+            child.removeAttribute('style');
+            if (color) child.style.color = color;
+          } else {
+            child.removeAttribute(attr.name);
+          }
+        });
+        clean(child);
+      } else if (child.nodeType !== 3) {
+        node.removeChild(child);
+      }
+    });
+  })(tmp);
+  return tmp.innerHTML;
+}
+</script>
+
+<!-- ═══ AI 工具中心：Google 登入（限 @morcept.com）＋使用紀錄（morceptaioverview 的 usage_logs）═══
+     分頁一直開著也會記錄：打開時記一次，之後只要有操作（點擊、按鍵、切回這個分頁），每 20 分鐘再記一次。
+     安全機制：這個網址還沒加進 morceptaioverview 的「授權網域」時，不顯示登入門檻、工具照常使用（只是不記錄），
+     加好網域後自動生效。設定：TOOL_ID／TOOL_NAME。 -->
+<script>
+(function () {
+  var TOOL_ID = 'teaching-manual-admin', TOOL_NAME = '維運-客戶教學（編輯版）';
+  var HUB = { apiKey: 'AIzaSyBjlXKMeerSnNO6ASadsH_8N2sMSmGokJQ', authDomain: 'morceptaioverview.firebaseapp.com', projectId: 'morceptaioverview', storageBucket: 'morceptaioverview.firebasestorage.app', messagingSenderId: '536899294593', appId: '1:536899294593:web:37623fd934b9814a33c480' };
+  var WINDOW_MS = 20 * 60 * 1000;
+
+  function load(src) { return new Promise(function (ok, fail) { var s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = fail; document.head.appendChild(s); }); }
+  // 沿用頁面已載入的 Firebase compat 版本；沒有就載入 10.13.2
+  function ensureSdk() {
+    var v = (window.firebase && firebase.SDK_VERSION) || '10.13.2', base = 'https://www.gstatic.com/firebasejs/' + v + '/';
+    var p = window.firebase && firebase.initializeApp ? Promise.resolve() : load(base + 'firebase-app-compat.js');
+    return p.then(function () { return firebase.auth ? null : load(base + 'firebase-auth-compat.js'); })
+            .then(function () { return firebase.firestore ? null : load(base + 'firebase-firestore-compat.js'); });
+  }
+  function domainAllowed() {
+    return fetch('https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig?key=' + HUB.apiKey)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { return (d.authorizedDomains || []).indexOf(location.hostname) !== -1; })
+      .catch(function () { return false; });
+  }
+
+  // 登入門檻畫面
+  var gate = document.createElement('div');
+  gate.id = 'aithGate';
+  gate.setAttribute('style', 'position:fixed;inset:0;z-index:2147483000;background:rgba(20,21,29,.92);display:none;align-items:center;justify-content:center;font-family:-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;');
+  gate.innerHTML = '<div style="background:#1c1d29;border:1px solid #33344a;border-radius:14px;padding:32px 28px;max-width:340px;width:88%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.4);">' +
+    '<div style="font-size:15px;font-weight:600;color:#e9e7f0;margin-bottom:6px;">請先登入</div>' +
+    '<div style="font-size:12.5px;color:#9a9bb5;margin-bottom:18px;line-height:1.6;">這是默聲創意內部工具，限 @morcept.com 帳號使用</div>' +
+    '<button id="aithSignInBtn" type="button" style="width:100%;padding:11px;border-radius:8px;border:none;background:#e8b64c;color:#14151d;font-weight:600;font-size:14px;cursor:pointer;">使用 Google 帳號登入</button>' +
+    '<div id="aithGateError" style="font-size:12px;color:#e0955a;margin-top:12px;min-height:16px;"></div></div>';
+
+  domainAllowed().then(function (ok) {
+    if (!ok) { console.info('[AI 工具中心] ' + location.hostname + ' 尚未加入授權網域，暫不啟用登入與使用紀錄'); return; }
+    return ensureSdk().then(start);
+  }).catch(function (e) { console.warn('[AI 工具中心] 使用紀錄初始化失敗', e); });
+
+  function start() {
+    var app; try { app = firebase.app('hub'); } catch (e) { app = firebase.initializeApp(HUB, 'hub'); }
+    var auth = app.auth(), db = app.firestore(), user = null, pending = false;
+    var provider = new firebase.auth.GoogleAuthProvider(); provider.setCustomParameters({ hd: 'morcept.com' });
+    document.body.appendChild(gate);
+    var errEl = gate.querySelector('#aithGateError');
+
+    function log(source) {
+      if (!user || pending) return;
+      var key = 'aith_last_use_' + TOOL_ID + '_' + user.email, last = 0;
+      try { last = parseInt(localStorage.getItem(key) || '0', 10); } catch (e) {}
+      if (Date.now() - last < WINDOW_MS) return;
+      pending = true;
+      db.collection('usage_logs').add({ tool_id: TOOL_ID, tool_name: TOOL_NAME, action: 'open', user: user.email, timestamp: firebase.firestore.FieldValue.serverTimestamp(), source: source })
+        .then(function () { try { localStorage.setItem(key, String(Date.now())); } catch (e) {} })
+        .catch(function (err) { console.warn('[AI 工具中心] usage_logs 寫入失敗', err.code || err); })
+        .then(function () { pending = false; });
+    }
+    auth.onAuthStateChanged(function (u) {
+      if (u && u.email && /@morcept\.com$/i.test(u.email)) {
+        user = u; gate.style.display = 'none'; log('direct_open');
+      } else if (u) {
+        errEl.textContent = '請用 @morcept.com 帳號登入'; auth.signOut();
+      } else { user = null; gate.style.display = 'flex'; }
+    });
+    // 分頁開著持續使用：點擊、按鍵、切回分頁都算（同一人 20 分鐘內只記一次）
+    document.addEventListener('click', function (e) { if (!gate.contains(e.target)) log('active_use'); }, true);
+    document.addEventListener('keydown', function () { log('active_use'); }, true);
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') log('active_use'); });
+
+    gate.querySelector('#aithSignInBtn').addEventListener('click', function () {
+      errEl.textContent = '';
+      auth.signInWithPopup(provider).then(function (res) {
+        var tok = res.credential && res.credential.accessToken;
+        if (tok && typeof window.hubOnGoogleToken === 'function') window.hubOnGoogleToken(tok); // 工具自己也有 Google 登入時一起登入
+      }).catch(function (err) {
+        if (err.code === 'auth/popup-blocked' || err.code === 'auth/cancelled-popup-request') auth.signInWithRedirect(provider);
+        else if (err.code !== 'auth/popup-closed-by-user') errEl.textContent = '登入失敗：' + err.message;
+      });
+    });
+    // 工具自己的 Google 登入完成時呼叫，順便登入工具中心，不用再按一次
+    window.hubUsageLinkGoogle = function (accessToken) {
+      if (!accessToken || user) return;
+      auth.signInWithCredential(firebase.auth.GoogleAuthProvider.credential(null, accessToken)).catch(function (e) { console.warn('[AI 工具中心] 連結登入失敗', e.code || e); });
+    };
+  }
+})();
 </script>
 </body>
 </html>
